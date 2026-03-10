@@ -12,26 +12,27 @@ if not GEMINI_API_KEY:
 mcp = FastMCP(
     name="gemini-image",
     instructions=(
-        "Use generate_image to create images from text prompts via Google Imagen 4. "
-        "Supports different aspect ratios (1:1, 3:4, 4:3, 9:16, 16:9) and quality tiers "
-        "(standard, fast, ultra)."
+        "Use generate_image to create images from text prompts via Google Gemini. "
+        "Defaults to gemini-3.1-flash-image-preview. "
+        "Supports different aspect ratios (1:1, 3:4, 4:3, 9:16, 16:9)."
     ),
 )
 
 API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
+DEFAULT_MODEL = "gemini-3.1-flash-image-preview"
+
 
 # -- Shared helpers ----------------------------------------------------------
 
 
-async def imagen_generate(
+async def gemini_generate_image(
     prompt: str,
-    model: str = "imagen-4.0-generate-001",
+    model: str = DEFAULT_MODEL,
     aspect_ratio: str = "1:1",
-    person_generation: str = "allow_adult",
-) -> bytes:
-    """POST to Imagen API and return decoded PNG bytes."""
-    url = f"{API_BASE}/{model}:predict"
+) -> tuple[bytes, str]:
+    """POST to Gemini generateContent API and return (image_bytes, mime_type)."""
+    url = f"{API_BASE}/{model}:generateContent"
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
             url,
@@ -40,23 +41,27 @@ async def imagen_generate(
                 "x-goog-api-key": GEMINI_API_KEY,
             },
             json={
-                "instances": [{"prompt": prompt}],
-                "parameters": {
-                    "sampleCount": 1,
-                    "aspectRatio": aspect_ratio,
-                    "personGeneration": person_generation,
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "responseModalities": ["TEXT", "IMAGE"],
+                    "imageConfig": {"aspectRatio": aspect_ratio},
                 },
             },
         )
         if resp.status_code != 200:
-            raise RuntimeError(f"Imagen API error ({resp.status_code}): {resp.text}")
+            raise RuntimeError(f"Gemini API error ({resp.status_code}): {resp.text}")
         data = resp.json()
 
-    predictions = data.get("predictions")
-    if not predictions or "bytesBase64Encoded" not in predictions[0]:
-        raise RuntimeError("No image data in Imagen API response.")
+    candidates = data.get("candidates", [])
+    if not candidates:
+        raise RuntimeError("No candidates in Gemini API response.")
 
-    return base64.b64decode(predictions[0]["bytesBase64Encoded"])
+    for part in candidates[0].get("content", {}).get("parts", []):
+        if "inlineData" in part:
+            inline = part["inlineData"]
+            return base64.b64decode(inline["data"]), inline.get("mimeType", "image/png")
+
+    raise RuntimeError("No image data in Gemini API response.")
 
 
 # -- Tools -------------------------------------------------------------------
@@ -66,21 +71,19 @@ async def imagen_generate(
 async def generate_image(
     prompt: str,
     aspect_ratio: str = "1:1",
-    model: str = "imagen-4.0-generate-001",
-    person_generation: str = "allow_adult",
+    model: str = DEFAULT_MODEL,
 ) -> Image:
-    """Generate an image from a text prompt using Google Imagen 4.
+    """Generate an image from a text prompt using Google Gemini.
 
     Args:
         prompt: Text description of the image to generate.
         aspect_ratio: Aspect ratio — 1:1, 3:4, 4:3, 9:16, or 16:9.
-        model: Model to use — imagen-4.0-generate-001 (standard),
-               imagen-4.0-fast-generate-001 (faster), or
-               imagen-4.0-ultra-generate-001 (highest quality).
-        person_generation: Person generation policy — dont_allow, allow_adult, or allow_all.
+        model: Model to use. Defaults to gemini-3.1-flash-image-preview.
+               Also supports gemini-3-pro-image-preview or gemini-2.5-flash-image.
     """
-    image_bytes = await imagen_generate(prompt, model, aspect_ratio, person_generation)
-    return Image(data=image_bytes, format="png")
+    image_bytes, mime_type = await gemini_generate_image(prompt, model, aspect_ratio)
+    fmt = "png" if "png" in mime_type else "jpeg"
+    return Image(data=image_bytes, format=fmt)
 
 
 if __name__ == "__main__":
